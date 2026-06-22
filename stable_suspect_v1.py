@@ -4,26 +4,30 @@ import math
 import os
 import csv
 from collections import defaultdict, deque
+import easyocr
+import re
+from collections import Counter
 
 # =====================================
 # MODELS
 # =====================================
 
 smoke_model = YOLO(
-    r"D:\yolo_runs\smoke_finetuned_hardneg\weights\best.pt"
+    r"C:\Users\Home\Desktop\final\combined_smoke_dataset\best.pt"
 )
 
 vehicle_model = YOLO("yolov8n.pt")
 
 plate_model = YOLO(
-    r"C:\Users\E028.26\Downloads\best.pt"
+    r"C:\Users\Home\Desktop\final\combined_smoke_dataset\plate.pt"
 )
+reader = easyocr.Reader(['en'])
 
 # =====================================
 # INPUT VIDEO
 # =====================================
 
-video_path = r"C:\Users\E028.26\Downloads\WhatsApp Video 2026-06-19 at 3.50.10 PM.mp4"
+video_path = r"C:\Users\Home\Downloads\WhatsApp Video 2026-06-22 at 10.49.27.mp4"
 
 # =====================================
 # OUTPUT FOLDERS
@@ -45,7 +49,8 @@ with open(log_file, "w", newline="") as f:
         "Vehicle_Type",
         "Timestamp",
         "Smoke_Count",
-        "Frame_Number"
+        "Frame_Number",
+        "Plate_Number"
     ])
 
 # =====================================
@@ -58,6 +63,7 @@ used_ids_this_frame = set()
 track_age = defaultdict(int)
 smoke_history = defaultdict(lambda: deque(maxlen=150))
 saved_suspects = set()
+vehicle_ocr_history = defaultdict(list)
 
 # =====================================
 # BEST FRAME STORAGE
@@ -129,19 +135,19 @@ def match_or_create_stable_id(vehicle_box, vehicle_name, frame_no):
             continue
 
         frames_missing = frame_no - data["last_seen"]
-        if frames_missing > 120:
+        if frames_missing > 300:
             continue
 
         old_box = data["box"]
         overlap = iou(vehicle_box, old_box)
 
-        if overlap < 0.05:
+        if overlap < 0.01:
             continue
 
         d = distance(vc, center(old_box))
         size_ratio = box_area(vehicle_box) / max(box_area(old_box), 1)
 
-        if not (0.5 <= size_ratio <= 2.0):
+        if not (0.3 <= size_ratio <= 3.0):
             continue
 
         score = overlap * 5
@@ -195,6 +201,102 @@ def smoke_near_vehicle(smoke_box, vehicle_box):
     sc = center(smoke_box)
 
     return (ex1 <= sc[0] <= ex2 and ey1 <= sc[1] <= ey2)
+
+
+# =====================================
+# PLATE OCR HELPERS
+# =====================================
+
+def fix_plate_ocr(plate_number):
+    """
+    Fix common OCR misreads for Indian plates: XX00XX0000
+    Position 0,1 = letters
+    Position 2,3 = digits
+    Position 4,5 = letters
+    Position 6-9  = digits
+    """
+    if len(plate_number) != 10:
+        return plate_number
+
+    result = list(plate_number)
+
+    digit_positions = [2, 3, 6, 7, 8, 9]
+    letter_positions = [0, 1, 4, 5]
+
+    letter_fixes = {'0': 'O', '1': 'I', '8': 'B', '5': 'S'}
+    digit_fixes  = {'O': '0', 'I': '1', 'B': '8', 'S': '5', 'Z': '2', 'G': '6'}
+
+    for i in digit_positions:
+        if result[i] in digit_fixes:
+            result[i] = digit_fixes[result[i]]
+
+    for i in letter_positions:
+        if result[i] in letter_fixes:
+            result[i] = letter_fixes[result[i]]
+
+    return "".join(result)
+
+
+def read_plate_from_crop(plate_crop, stable_id):
+    """
+    Run OCR on plate crop and return best valid Indian plate string or None.
+    """
+    gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+
+    # Resize to fixed Indian plate ratio
+    gray = cv2.resize(gray, (333, 75))
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    _, thresh = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    results = reader.readtext(
+        thresh,
+        allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        detail=1,
+        paragraph=False
+    )
+
+    print(f"  Raw OCR for Vehicle {stable_id}: {results}")
+
+    # Sort by confidence high to low
+    results_sorted = sorted(results, key=lambda x: x[2], reverse=True)
+
+    # Step 1: Try each chunk individually
+    for ocr_item in results_sorted:
+        text = re.sub(r'[^A-Z0-9]', '', ocr_item[1].upper())
+        fixed = fix_plate_ocr(text)
+        print(f"  Chunk: '{text}' -> Fixed: '{fixed}' (conf: {ocr_item[2]:.2f})")
+        if re.match(r'^[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}$', fixed):
+            print(f"  VALID (single chunk): {fixed}")
+            return fixed
+
+    # Step 2: Join top chunks and use sliding window of 10
+    joined = "".join([
+        re.sub(r'[^A-Z0-9]', '', r[1].upper())
+        for r in results_sorted[:6]
+    ])
+    print(f"  Joined: '{joined}'")
+
+    for i in range(len(joined) - 9):
+        chunk = joined[i:i+10]
+        fixed = fix_plate_ocr(chunk)
+        if re.match(r'^[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}$', fixed):
+            print(f"  VALID (sliding window): {fixed}")
+            return fixed
+
+    # Step 3: Return best partial (8-11 chars) as fallback
+    for ocr_item in results_sorted:
+        text = re.sub(r'[^A-Z0-9]', '', ocr_item[1].upper())
+        if 8 <= len(text) <= 11:
+            fixed = fix_plate_ocr(text)
+            print(f"  Partial fallback: {fixed}")
+            return fixed
+
+    print(f"  No plate found")
+    return None
+
 
 # =====================================
 # VIDEO INPUT
@@ -358,28 +460,72 @@ while True:
                 if stable_id in best_vehicle_crop:
                     cv2.imwrite(crop_path, best_vehicle_crop[stable_id])
 
-                    vehicle_crop = best_vehicle_crop[stable_id]
-                    plate_results = plate_model(
-                        vehicle_crop, conf=0.10, verbose=False
-                    )
+                # ------------------
+                # PLATE DETECTION
+                # ------------------
 
+                vehicle_crop = best_vehicle_crop.get(stable_id, None)
+                plate_results = None
+
+                if vehicle_crop is not None and vehicle_crop.size > 0:
+                    try:
+                        plate_results = plate_model(
+                            vehicle_crop, conf=0.10, verbose=False
+                        )
+                    except Exception as e:
+                        print(f"Plate model error for Vehicle {stable_id}: {e}")
+
+                if plate_results is not None:
                     for plate_box in plate_results[0].boxes:
                         px1, py1, px2, py2 = map(int, plate_box.xyxy[0])
+
+                        # Small padding
+                        pad = 5
+                        px1 = max(0, px1 - pad)
+                        py1 = max(0, py1 - pad)
+                        px2 = min(vehicle_crop.shape[1], px2 + pad)
+                        py2 = min(vehicle_crop.shape[0], py2 + pad)
+
                         plate_crop = vehicle_crop[py1:py2, px1:px2]
 
+                        if plate_crop.size == 0:
+                            continue
+
+                        # Save plate image
                         plate_path = os.path.join(
                             evidence_dir, f"Vehicle_{stable_id}_plate.jpg"
                         )
                         cv2.imwrite(plate_path, plate_crop)
-                        print(f"Plate saved for Vehicle {stable_id}")
+
+                        # Run OCR
+                        plate_number = read_plate_from_crop(plate_crop, stable_id)
+
+                        if plate_number:
+                            vehicle_ocr_history[stable_id].append(plate_number)
+
+                # ------------------
+                # FINAL PLATE
+                # ------------------
+
+                if vehicle_ocr_history[stable_id]:
+                    final_plate = Counter(
+                        vehicle_ocr_history[stable_id]
+                    ).most_common(1)[0][0]
+                else:
+                    final_plate = "UNKNOWN"
 
                 with open(log_file, "a", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow([
-                        stable_id, name, time_string, smoke_count, frame_no
+                        stable_id,
+                        name,
+                        time_string,
+                        smoke_count,
+                        frame_no,
+                        final_plate
                     ])
 
-                print(f"Suspect {stable_id} saved")
+                print(f"Suspect {stable_id} saved | Plate: {final_plate}")
                 saved_suspects.add(stable_id)
 
         else:
